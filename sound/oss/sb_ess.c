@@ -865,6 +865,8 @@ printk(KERN_INFO "FKS: ess_dsp_reset 1\n");
 ess_show_mixerregs (devc);
 #endif
 
+	DEB(printk("Entered ess_dsp_reset()\n"));
+
 	outb(3, DSP_RESET); /* Reset FIFO too */
 
 	udelay(10);
@@ -878,6 +880,8 @@ ess_show_mixerregs (devc);
 		return 0;   /* Sorry */
 	}
 	ess_extended (devc);
+
+	DEB(printk("sb_dsp_reset() OK\n"));
 
 #ifdef FKS_LOGGING
 printk(KERN_INFO "FKS: dsp_reset 2\n");

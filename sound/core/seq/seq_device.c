@@ -56,7 +56,6 @@ MODULE_LICENSE("GPL");
 #define DRIVER_LOADED		(1<<0)
 #define DRIVER_REQUESTED	(1<<1)
 #define DRIVER_LOCKED		(1<<2)
-#define DRIVER_REQUESTING	(1<<3)
 
 struct ops_list {
 	char id[ID_LEN];	/* driver id */
@@ -128,88 +127,48 @@ static void snd_seq_device_info(struct snd_info_entry *entry,
 
 #ifdef CONFIG_MODULES
 /* avoid auto-loading during module_init() */
-static atomic_t snd_seq_in_init = ATOMIC_INIT(1); /* blocked as default */
+static int snd_seq_in_init;
 void snd_seq_autoload_lock(void)
 {
-	atomic_inc(&snd_seq_in_init);
+	snd_seq_in_init++;
 }
 
 void snd_seq_autoload_unlock(void)
 {
-	atomic_dec(&snd_seq_in_init);
+	snd_seq_in_init--;
 }
-
-static void autoload_drivers(void)
-{
-	/* avoid reentrance */
-	if (atomic_inc_return(&snd_seq_in_init) == 1) {
-		struct ops_list *ops;
-
-		mutex_lock(&ops_mutex);
-		list_for_each_entry(ops, &opslist, list) {
-			if ((ops->driver & DRIVER_REQUESTING) &&
-			    !(ops->driver & DRIVER_REQUESTED)) {
-				ops->used++;
-				mutex_unlock(&ops_mutex);
-				ops->driver |= DRIVER_REQUESTED;
-				request_module("snd-%s", ops->id);
-				mutex_lock(&ops_mutex);
-				ops->used--;
-			}
-		}
-		mutex_unlock(&ops_mutex);
-	}
-	atomic_dec(&snd_seq_in_init);
-}
-
-static void call_autoload(struct work_struct *work)
-{
-	autoload_drivers();
-}
-
-static DECLARE_WORK(autoload_work, call_autoload);
-
-static void try_autoload(struct ops_list *ops)
-{
-	if (!ops->driver) {
-		ops->driver |= DRIVER_REQUESTING;
-		schedule_work(&autoload_work);
-	}
-}
-
-static void queue_autoload_drivers(void)
-{
-	struct ops_list *ops;
-
-	mutex_lock(&ops_mutex);
-	list_for_each_entry(ops, &opslist, list)
-		try_autoload(ops);
-	mutex_unlock(&ops_mutex);
-}
-
-void snd_seq_autoload_init(void)
-{
-	atomic_dec(&snd_seq_in_init);
-#ifdef CONFIG_SND_SEQUENCER_MODULE
-	/* initial autoload only when snd-seq is a module */
-	queue_autoload_drivers();
-#endif
-}
-#else
-#define try_autoload(ops) /* NOP */
 #endif
 
 void snd_seq_device_load_drivers(void)
 {
 #ifdef CONFIG_MODULES
-	queue_autoload_drivers();
-	flush_work(&autoload_work);
+	struct ops_list *ops;
+
+	/* Calling request_module during module_init()
+	 * may cause blocking.
+	 */
+	if (snd_seq_in_init)
+		return;
+
+	mutex_lock(&ops_mutex);
+	list_for_each_entry(ops, &opslist, list) {
+		if (! (ops->driver & DRIVER_LOADED) &&
+		    ! (ops->driver & DRIVER_REQUESTED)) {
+			ops->used++;
+			mutex_unlock(&ops_mutex);
+			ops->driver |= DRIVER_REQUESTED;
+			request_module("snd-%s", ops->id);
+			mutex_lock(&ops_mutex);
+			ops->used--;
+		}
+	}
+	mutex_unlock(&ops_mutex);
 #endif
 }
 
 /*
  * register a sequencer device
- * card = card info
+ * card = card info (NULL allowed)
  * device = device number (if any)
  * id = id of driver
  * result = return pointer (NULL allowed if unnecessary)
@@ -255,14 +214,13 @@ int snd_seq_device_new(struct snd_card *card, int device, char *id, int argsize,
 	ops->num_devices++;
 	mutex_unlock(&ops->reg_mutex);
 
+	unlock_driver(ops);
+	
 	if ((err = snd_device_new(card, SNDRV_DEV_SEQUENCER, dev, &dops)) < 0) {
 		snd_seq_device_free(dev);
 		return err;
 	}
 	
-	try_autoload(ops);
-	unlock_driver(ops);
-
 	if (result)
 		*result = dev;
 
@@ -360,12 +318,16 @@ int snd_seq_device_register_driver(char *id, struct snd_seq_dev_ops *entry,
 	    entry->init_device == NULL || entry->free_device == NULL)
 		return -EINVAL;
 
+	snd_seq_autoload_lock();
 	ops = find_driver(id, 1);
-	if (ops == NULL)
+	if (ops == NULL) {
+		snd_seq_autoload_unlock();
 		return -ENOMEM;
+	}
 	if (ops->driver & DRIVER_LOADED) {
-		pr_warn("ALSA: seq: driver_register: driver '%s' already exists\n", id);
+		snd_printk(KERN_WARNING "driver_register: driver '%s' already exists\n", id);
 		unlock_driver(ops);
+		snd_seq_autoload_unlock();
 		return -EBUSY;
 	}
 
@@ -382,6 +344,7 @@ int snd_seq_device_register_driver(char *id, struct snd_seq_dev_ops *entry,
 	mutex_unlock(&ops->reg_mutex);
 
 	unlock_driver(ops);
+	snd_seq_autoload_unlock();
 
 	return 0;
 }
@@ -435,7 +398,7 @@ int snd_seq_device_unregister_driver(char *id)
 		return -ENXIO;
 	if (! (ops->driver & DRIVER_LOADED) ||
 	    (ops->driver & DRIVER_LOCKED)) {
-		pr_err("ALSA: seq: driver_unregister: cannot unload driver '%s': status=%x\n",
+		snd_printk(KERN_ERR "driver_unregister: cannot unload driver '%s': status=%x\n",
 			   id, ops->driver);
 		unlock_driver(ops);
 		return -EBUSY;
@@ -450,7 +413,7 @@ int snd_seq_device_unregister_driver(char *id)
 
 	ops->driver = 0;
 	if (ops->num_init_devices > 0)
-		pr_err("ALSA: seq: free_driver: init_devices > 0!! (%d)\n",
+		snd_printk(KERN_ERR "free_driver: init_devices > 0!! (%d)\n",
 			   ops->num_init_devices);
 	mutex_unlock(&ops->reg_mutex);
 
@@ -496,7 +459,7 @@ static int init_device(struct snd_seq_device *dev, struct ops_list *ops)
 	if (dev->status != SNDRV_SEQ_DEVICE_FREE)
 		return 0; /* already initialized */
 	if (ops->argsize != dev->argsize) {
-		pr_err("ALSA: seq: incompatible device '%s' for plug-in '%s' (%d %d)\n",
+		snd_printk(KERN_ERR "incompatible device '%s' for plug-in '%s' (%d %d)\n",
 			   dev->name, ops->id, ops->argsize, dev->argsize);
 		return -EINVAL;
 	}
@@ -504,7 +467,7 @@ static int init_device(struct snd_seq_device *dev, struct ops_list *ops)
 		dev->status = SNDRV_SEQ_DEVICE_REGISTERED;
 		ops->num_init_devices++;
 	} else {
-		pr_err("ALSA: seq: init_device failed: %s: %s\n",
+		snd_printk(KERN_ERR "init_device failed: %s: %s\n",
 			   dev->name, dev->id);
 	}
 
@@ -523,7 +486,7 @@ static int free_device(struct snd_seq_device *dev, struct ops_list *ops)
 	if (dev->status != SNDRV_SEQ_DEVICE_REGISTERED)
 		return 0; /* not registered */
 	if (ops->argsize != dev->argsize) {
-		pr_err("ALSA: seq: incompatible device '%s' for plug-in '%s' (%d %d)\n",
+		snd_printk(KERN_ERR "incompatible device '%s' for plug-in '%s' (%d %d)\n",
 			   dev->name, ops->id, ops->argsize, dev->argsize);
 		return -EINVAL;
 	}
@@ -532,7 +495,7 @@ static int free_device(struct snd_seq_device *dev, struct ops_list *ops)
 		dev->driver_data = NULL;
 		ops->num_init_devices--;
 	} else {
-		pr_err("ALSA: seq: free_device failed: %s: %s\n",
+		snd_printk(KERN_ERR "free_device failed: %s: %s\n",
 			   dev->name, dev->id);
 	}
 
@@ -591,15 +554,12 @@ static int __init alsa_seq_device_init(void)
 
 static void __exit alsa_seq_device_exit(void)
 {
-#ifdef CONFIG_MODULES
-	cancel_work_sync(&autoload_work);
-#endif
 	remove_drivers();
 #ifdef CONFIG_PROC_FS
 	snd_info_free_entry(info_entry);
 #endif
 	if (num_ops)
-		pr_err("ALSA: seq: drivers not released (%d)\n", num_ops);
+		snd_printk(KERN_ERR "drivers not released (%d)\n", num_ops);
 }
 
 module_init(alsa_seq_device_init)
@@ -610,7 +570,6 @@ EXPORT_SYMBOL(snd_seq_device_new);
 EXPORT_SYMBOL(snd_seq_device_register_driver);
 EXPORT_SYMBOL(snd_seq_device_unregister_driver);
 #ifdef CONFIG_MODULES
-EXPORT_SYMBOL(snd_seq_autoload_init);
 EXPORT_SYMBOL(snd_seq_autoload_lock);
 EXPORT_SYMBOL(snd_seq_autoload_unlock);
 #endif
