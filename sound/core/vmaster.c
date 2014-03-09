@@ -68,13 +68,10 @@ static int slave_update(struct link_slave *slave)
 		return -ENOMEM;
 	uctl->id = slave->slave.id;
 	err = slave->slave.get(&slave->slave, uctl);
-	if (err < 0)
-		goto error;
 	for (ch = 0; ch < slave->info.count; ch++)
 		slave->vals[ch] = uctl->value.integer.value[ch];
- error:
 	kfree(uctl);
-	return err < 0 ? err : 0;
+	return 0;
 }
 
 /* get the slave ctl info and save the initial values */
@@ -104,7 +101,7 @@ static int slave_init(struct link_slave *slave)
 	if (slave->info.count > 2  ||
 	    (slave->info.type != SNDRV_CTL_ELEM_TYPE_INTEGER &&
 	     slave->info.type != SNDRV_CTL_ELEM_TYPE_BOOLEAN)) {
-		pr_err("ALSA: vmaster: invalid slave element\n");
+		snd_printk(KERN_ERR "invalid slave element\n");
 		kfree(uinfo);
 		return -EINVAL;
 	}
