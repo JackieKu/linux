@@ -40,7 +40,6 @@
 #include <sound/pcm_params.h>
 #include <sound/soc.h>
 #include <sound/dmaengine_pcm.h>
-#include <sound/omap-pcm.h>
 
 #include "omap-mcpdm.h"
 
@@ -54,8 +53,6 @@ struct omap_mcpdm {
 	unsigned long phys_base;
 	void __iomem *io_base;
 	int irq;
-	struct pm_qos_request pm_qos_req;
-	int latency[2];
 
 	struct mutex mutex;
 
@@ -268,6 +265,9 @@ static int omap_mcpdm_dai_startup(struct snd_pcm_substream *substream,
 	}
 	mutex_unlock(&mcpdm->mutex);
 
+	snd_soc_dai_set_dma_data(dai, substream,
+				 &mcpdm->dma_data[substream->stream]);
+
 	return 0;
 }
 
@@ -275,9 +275,6 @@ static void omap_mcpdm_dai_shutdown(struct snd_pcm_substream *substream,
 				  struct snd_soc_dai *dai)
 {
 	struct omap_mcpdm *mcpdm = snd_soc_dai_get_drvdata(dai);
-	int tx = (substream->stream == SNDRV_PCM_STREAM_PLAYBACK);
-	int stream1 = tx ? SNDRV_PCM_STREAM_PLAYBACK : SNDRV_PCM_STREAM_CAPTURE;
-	int stream2 = tx ? SNDRV_PCM_STREAM_CAPTURE : SNDRV_PCM_STREAM_PLAYBACK;
 
 	mutex_lock(&mcpdm->mutex);
 
@@ -290,14 +287,6 @@ static void omap_mcpdm_dai_shutdown(struct snd_pcm_substream *substream,
 		}
 	}
 
-	if (mcpdm->latency[stream2])
-		pm_qos_update_request(&mcpdm->pm_qos_req,
-				      mcpdm->latency[stream2]);
-	else if (mcpdm->latency[stream1])
-		pm_qos_remove_request(&mcpdm->pm_qos_req);
-
-	mcpdm->latency[stream1] = 0;
-
 	mutex_unlock(&mcpdm->mutex);
 }
 
@@ -309,7 +298,7 @@ static int omap_mcpdm_dai_hw_params(struct snd_pcm_substream *substream,
 	int stream = substream->stream;
 	struct snd_dmaengine_dai_dma_data *dma_data;
 	u32 threshold;
-	int channels, latency;
+	int channels;
 	int link_mask = 0;
 
 	channels = params_channels(params);
@@ -349,24 +338,13 @@ static int omap_mcpdm_dai_hw_params(struct snd_pcm_substream *substream,
 
 		dma_data->maxburst =
 				(MCPDM_DN_THRES_MAX - threshold) * channels;
-		latency = threshold;
 	} else {
 		/* If playback is not running assume a stereo stream to come */
 		if (!mcpdm->config[!stream].link_mask)
 			mcpdm->config[!stream].link_mask = (0x3 << 3);
 
 		dma_data->maxburst = threshold * channels;
-		latency = (MCPDM_DN_THRES_MAX - threshold);
 	}
-
-	/*
-	 * The DMA must act to a DMA request within latency time (usec) to avoid
-	 * under/overflow
-	 */
-	mcpdm->latency[stream] = latency * USEC_PER_SEC / params_rate(params);
-
-	if (!mcpdm->latency[stream])
-		mcpdm->latency[stream] = 10;
 
 	/* Check if we need to restart McPDM with this stream */
 	if (mcpdm->config[stream].link_mask &&
@@ -382,20 +360,6 @@ static int omap_mcpdm_prepare(struct snd_pcm_substream *substream,
 				  struct snd_soc_dai *dai)
 {
 	struct omap_mcpdm *mcpdm = snd_soc_dai_get_drvdata(dai);
-	struct pm_qos_request *pm_qos_req = &mcpdm->pm_qos_req;
-	int tx = (substream->stream == SNDRV_PCM_STREAM_PLAYBACK);
-	int stream1 = tx ? SNDRV_PCM_STREAM_PLAYBACK : SNDRV_PCM_STREAM_CAPTURE;
-	int stream2 = tx ? SNDRV_PCM_STREAM_CAPTURE : SNDRV_PCM_STREAM_PLAYBACK;
-	int latency = mcpdm->latency[stream2];
-
-	/* Prevent omap hardware from hitting off between FIFO fills */
-	if (!latency || mcpdm->latency[stream1] < latency)
-		latency = mcpdm->latency[stream1];
-
-	if (pm_qos_request_active(pm_qos_req))
-		pm_qos_update_request(pm_qos_req, latency);
-	else if (latency)
-		pm_qos_add_request(pm_qos_req, PM_QOS_CPU_DMA_LATENCY, latency);
 
 	if (!omap_mcpdm_active(mcpdm)) {
 		omap_mcpdm_start(mcpdm);
@@ -442,11 +406,6 @@ static int omap_mcpdm_probe(struct snd_soc_dai *dai)
 	mcpdm->config[SNDRV_PCM_STREAM_PLAYBACK].threshold = 2;
 	mcpdm->config[SNDRV_PCM_STREAM_CAPTURE].threshold =
 							MCPDM_UP_THRES_MAX - 3;
-
-	snd_soc_dai_init_dma_data(dai,
-				  &mcpdm->dma_data[SNDRV_PCM_STREAM_PLAYBACK],
-				  &mcpdm->dma_data[SNDRV_PCM_STREAM_CAPTURE]);
-
 	return ret;
 }
 
@@ -456,9 +415,6 @@ static int omap_mcpdm_remove(struct snd_soc_dai *dai)
 
 	free_irq(mcpdm->irq, (void *)mcpdm);
 	pm_runtime_disable(mcpdm->dev);
-
-	if (pm_qos_request_active(&mcpdm->pm_qos_req))
-		pm_qos_remove_request(&mcpdm->pm_qos_req);
 
 	return 0;
 }
@@ -505,7 +461,6 @@ static int asoc_mcpdm_probe(struct platform_device *pdev)
 {
 	struct omap_mcpdm *mcpdm;
 	struct resource *res;
-	int ret;
 
 	mcpdm = devm_kzalloc(&pdev->dev, sizeof(struct omap_mcpdm), GFP_KERNEL);
 	if (!mcpdm)
@@ -536,13 +491,9 @@ static int asoc_mcpdm_probe(struct platform_device *pdev)
 
 	mcpdm->dev = &pdev->dev;
 
-	ret =  devm_snd_soc_register_component(&pdev->dev,
+	return devm_snd_soc_register_component(&pdev->dev,
 					       &omap_mcpdm_component,
 					       &omap_mcpdm_dai, 1);
-	if (ret)
-		return ret;
-
-	return omap_pcm_platform_register(&pdev->dev);
 }
 
 static const struct of_device_id omap_mcpdm_of_match[] = {
@@ -554,6 +505,7 @@ MODULE_DEVICE_TABLE(of, omap_mcpdm_of_match);
 static struct platform_driver asoc_mcpdm_driver = {
 	.driver = {
 		.name	= "omap-mcpdm",
+		.owner	= THIS_MODULE,
 		.of_match_table = omap_mcpdm_of_match,
 	},
 

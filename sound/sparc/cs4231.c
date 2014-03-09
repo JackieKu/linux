@@ -1146,8 +1146,10 @@ static int snd_cs4231_playback_open(struct snd_pcm_substream *substream)
 	runtime->hw = snd_cs4231_playback;
 
 	err = snd_cs4231_open(chip, CS4231_MODE_PLAY);
-	if (err < 0)
+	if (err < 0) {
+		snd_free_pages(runtime->dma_area, runtime->dma_bytes);
 		return err;
+	}
 	chip->playback_substream = substream;
 	chip->p_periods_sent = 0;
 	snd_pcm_set_sync(substream);
@@ -1165,8 +1167,10 @@ static int snd_cs4231_capture_open(struct snd_pcm_substream *substream)
 	runtime->hw = snd_cs4231_capture;
 
 	err = snd_cs4231_open(chip, CS4231_MODE_RECORD);
-	if (err < 0)
+	if (err < 0) {
+		snd_free_pages(runtime->dma_area, runtime->dma_bytes);
 		return err;
+	}
 	chip->capture_substream = substream;
 	chip->c_periods_sent = 0;
 	snd_pcm_set_sync(substream);
@@ -1281,11 +1285,19 @@ static int snd_cs4231_timer(struct snd_card *card)
 static int snd_cs4231_info_mux(struct snd_kcontrol *kcontrol,
 			       struct snd_ctl_elem_info *uinfo)
 {
-	static const char * const texts[4] = {
+	static char *texts[4] = {
 		"Line", "CD", "Mic", "Mix"
 	};
 
-	return snd_ctl_enum_info(uinfo, 2, 4, texts);
+	uinfo->type = SNDRV_CTL_ELEM_TYPE_ENUMERATED;
+	uinfo->count = 2;
+	uinfo->value.enumerated.items = 4;
+	if (uinfo->value.enumerated.item > 3)
+		uinfo->value.enumerated.item = 3;
+	strcpy(uinfo->value.enumerated.name,
+		texts[uinfo->value.enumerated.item]);
+
+	return 0;
 }
 
 static int snd_cs4231_get_mux(struct snd_kcontrol *kcontrol,
@@ -1553,8 +1565,7 @@ static int snd_cs4231_mixer(struct snd_card *card)
 
 static int dev;
 
-static int cs4231_attach_begin(struct platform_device *op,
-			       struct snd_card **rcard)
+static int cs4231_attach_begin(struct snd_card **rcard)
 {
 	struct snd_card *card;
 	struct snd_cs4231 *chip;
@@ -1570,8 +1581,8 @@ static int cs4231_attach_begin(struct platform_device *op,
 		return -ENOENT;
 	}
 
-	err = snd_card_new(&op->dev, index[dev], id[dev], THIS_MODULE,
-			   sizeof(struct snd_cs4231), &card);
+	err = snd_card_create(index[dev], id[dev], THIS_MODULE,
+			      sizeof(struct snd_cs4231), &card);
 	if (err < 0)
 		return err;
 
@@ -1858,7 +1869,7 @@ static int cs4231_sbus_probe(struct platform_device *op)
 	struct snd_card *card;
 	int err;
 
-	err = cs4231_attach_begin(op, &card);
+	err = cs4231_attach_begin(&card);
 	if (err)
 		return err;
 
@@ -2049,7 +2060,7 @@ static int cs4231_ebus_probe(struct platform_device *op)
 	struct snd_card *card;
 	int err;
 
-	err = cs4231_attach_begin(op, &card);
+	err = cs4231_attach_begin(&card);
 	if (err)
 		return err;
 
@@ -2107,6 +2118,7 @@ MODULE_DEVICE_TABLE(of, cs4231_match);
 static struct platform_driver cs4231_driver = {
 	.driver = {
 		.name = "audio",
+		.owner = THIS_MODULE,
 		.of_match_table = cs4231_match,
 	},
 	.probe		= cs4231_probe,
