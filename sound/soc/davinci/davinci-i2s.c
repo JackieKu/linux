@@ -757,6 +757,7 @@ static int davinci_i2s_remove(struct platform_device *pdev)
 	struct davinci_mcbsp_dev *dev = dev_get_drvdata(&pdev->dev);
 
 	snd_soc_unregister_component(&pdev->dev);
+	davinci_soc_platform_unregister(&pdev->dev);
 
 	clk_disable(dev->clk);
 	clk_put(dev->clk);
@@ -770,6 +771,7 @@ static struct platform_driver davinci_mcbsp_driver = {
 	.remove		= davinci_i2s_remove,
 	.driver		= {
 		.name	= "davinci-mcbsp",
+		.owner	= THIS_MODULE,
 	},
 };
 

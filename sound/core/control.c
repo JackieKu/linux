@@ -50,7 +50,7 @@ static int snd_ctl_open(struct inode *inode, struct file *file)
 	unsigned long flags;
 	struct snd_card *card;
 	struct snd_ctl_file *ctl;
-	int i, err;
+	int err;
 
 	err = nonseekable_open(inode, file);
 	if (err < 0)
@@ -79,8 +79,8 @@ static int snd_ctl_open(struct inode *inode, struct file *file)
 	init_waitqueue_head(&ctl->change_sleep);
 	spin_lock_init(&ctl->read_lock);
 	ctl->card = card;
-	for (i = 0; i < SND_CTL_SUBDEV_ITEMS; i++)
-		ctl->preferred_subdevice[i] = -1;
+	ctl->prefer_pcm_subdevice = -1;
+	ctl->prefer_rawmidi_subdevice = -1;
 	ctl->pid = get_pid(task_pid(current));
 	file->private_data = ctl;
 	write_lock_irqsave(&card->ctl_files_rwlock, flags);
@@ -141,16 +141,6 @@ static int snd_ctl_release(struct inode *inode, struct file *file)
 	return 0;
 }
 
-/**
- * snd_ctl_notify - Send notification to user-space for a control change
- * @card: the card to send notification
- * @mask: the event mask, SNDRV_CTL_EVENT_*
- * @id: the ctl element id to send notification
- *
- * This function adds an event record with the given id and mask, appends
- * to the list and wakes up the user-space for notification.  This can be
- * called in the atomic context.
- */
 void snd_ctl_notify(struct snd_card *card, unsigned int mask,
 		    struct snd_ctl_elem_id *id)
 {
@@ -161,7 +151,7 @@ void snd_ctl_notify(struct snd_card *card, unsigned int mask,
 	if (snd_BUG_ON(!card || !id))
 		return;
 	read_lock(&card->ctl_files_rwlock);
-#if IS_ENABLED(CONFIG_SND_MIXER_OSS)
+#if defined(CONFIG_SND_MIXER_OSS) || defined(CONFIG_SND_MIXER_OSS_MODULE)
 	card->mixer_oss_change_count++;
 #endif
 	list_for_each_entry(ctl, &card->ctl_files, list) {
@@ -180,7 +170,7 @@ void snd_ctl_notify(struct snd_card *card, unsigned int mask,
 			ev->mask = mask;
 			list_add_tail(&ev->list, &ctl->events);
 		} else {
-			dev_err(card->dev, "No memory available to allocate event\n");
+			snd_printk(KERN_ERR "No memory available to allocate event\n");
 		}
 	_found:
 		wake_up(&ctl->change_sleep);
@@ -189,6 +179,7 @@ void snd_ctl_notify(struct snd_card *card, unsigned int mask,
 	}
 	read_unlock(&card->ctl_files_rwlock);
 }
+
 EXPORT_SYMBOL(snd_ctl_notify);
 
 /**
@@ -215,7 +206,7 @@ static struct snd_kcontrol *snd_ctl_new(struct snd_kcontrol *control,
 
 	kctl = kzalloc(sizeof(*kctl) + sizeof(struct snd_kcontrol_volatile) * control->count, GFP_KERNEL);
 	if (kctl == NULL) {
-		pr_err("ALSA: Cannot allocate control instance\n");
+		snd_printk(KERN_ERR "Cannot allocate control instance\n");
 		return NULL;
 	}
 	*kctl = *control;
@@ -250,8 +241,9 @@ struct snd_kcontrol *snd_ctl_new1(const struct snd_kcontrol_new *ncontrol,
 	if (ncontrol->name) {
 		strlcpy(kctl.id.name, ncontrol->name, sizeof(kctl.id.name));
 		if (strcmp(ncontrol->name, kctl.id.name) != 0)
-			pr_warn("ALSA: Control name '%s' truncated to '%s'\n",
-				ncontrol->name, kctl.id.name);
+			snd_printk(KERN_WARNING
+				   "Control name '%s' truncated to '%s'\n",
+				   ncontrol->name, kctl.id.name);
 	}
 	kctl.id.index = ncontrol->index;
 	kctl.count = ncontrol->count ? ncontrol->count : 1;
@@ -270,6 +262,7 @@ struct snd_kcontrol *snd_ctl_new1(const struct snd_kcontrol_new *ncontrol,
 	kctl.private_data = private_data;
 	return snd_ctl_new(&kctl, access);
 }
+
 EXPORT_SYMBOL(snd_ctl_new1);
 
 /**
@@ -288,6 +281,7 @@ void snd_ctl_free_one(struct snd_kcontrol *kcontrol)
 		kfree(kcontrol);
 	}
 }
+
 EXPORT_SYMBOL(snd_ctl_free_one);
 
 static bool snd_ctl_remove_numid_conflict(struct snd_card *card,
@@ -316,7 +310,7 @@ static int snd_ctl_find_hole(struct snd_card *card, unsigned int count)
 	while (snd_ctl_remove_numid_conflict(card, count)) {
 		if (--iter == 0) {
 			/* this situation is very unlikely */
-			dev_err(card->dev, "unable to allocate new control numid\n");
+			snd_printk(KERN_ERR "unable to allocate new control numid\n");
 			return -ENOMEM;
 		}
 	}
@@ -355,7 +349,7 @@ int snd_ctl_add(struct snd_card *card, struct snd_kcontrol *kcontrol)
 	down_write(&card->controls_rwsem);
 	if (snd_ctl_find_id(card, &id)) {
 		up_write(&card->controls_rwsem);
-		dev_err(card->dev, "control %i:%i:%i:%s:%i is already present\n",
+		snd_printd(KERN_ERR "control %i:%i:%i:%s:%i is already present\n",
 					id.iface,
 					id.device,
 					id.subdevice,
@@ -373,7 +367,6 @@ int snd_ctl_add(struct snd_card *card, struct snd_kcontrol *kcontrol)
 	card->controls_count += kcontrol->count;
 	kcontrol->id.numid = card->last_numid + 1;
 	card->last_numid += kcontrol->count;
-	id = kcontrol->id;
 	count = kcontrol->count;
 	up_write(&card->controls_rwsem);
 	for (idx = 0; idx < count; idx++, id.index++, id.numid++)
@@ -384,6 +377,7 @@ int snd_ctl_add(struct snd_card *card, struct snd_kcontrol *kcontrol)
 	snd_ctl_free_one(kcontrol);
 	return err;
 }
+
 EXPORT_SYMBOL(snd_ctl_add);
 
 /**
@@ -440,7 +434,6 @@ add:
 	card->controls_count += kcontrol->count;
 	kcontrol->id.numid = card->last_numid + 1;
 	card->last_numid += kcontrol->count;
-	id = kcontrol->id;
 	count = kcontrol->count;
 	up_write(&card->controls_rwsem);
 	for (idx = 0; idx < count; idx++, id.index++, id.numid++)
@@ -479,6 +472,7 @@ int snd_ctl_remove(struct snd_card *card, struct snd_kcontrol *kcontrol)
 	snd_ctl_free_one(kcontrol);
 	return 0;
 }
+
 EXPORT_SYMBOL(snd_ctl_remove);
 
 /**
@@ -506,6 +500,7 @@ int snd_ctl_remove_id(struct snd_card *card, struct snd_ctl_elem_id *id)
 	up_write(&card->controls_rwsem);
 	return ret;
 }
+
 EXPORT_SYMBOL(snd_ctl_remove_id);
 
 /**
@@ -574,7 +569,7 @@ int snd_ctl_activate_id(struct snd_card *card, struct snd_ctl_elem_id *id,
 		ret = -ENOENT;
 		goto unlock;
 	}
-	index_offset = snd_ctl_get_ioff(kctl, id);
+	index_offset = snd_ctl_get_ioff(kctl, &kctl->id);
 	vd = &kctl->vd[index_offset];
 	ret = 0;
 	if (active) {
@@ -623,6 +618,7 @@ int snd_ctl_rename_id(struct snd_card *card, struct snd_ctl_elem_id *src_id,
 	up_write(&card->controls_rwsem);
 	return 0;
 }
+
 EXPORT_SYMBOL(snd_ctl_rename_id);
 
 /**
@@ -650,6 +646,7 @@ struct snd_kcontrol *snd_ctl_find_numid(struct snd_card *card, unsigned int numi
 	}
 	return NULL;
 }
+
 EXPORT_SYMBOL(snd_ctl_find_numid);
 
 /**
@@ -691,6 +688,7 @@ struct snd_kcontrol *snd_ctl_find_id(struct snd_card *card,
 	}
 	return NULL;
 }
+
 EXPORT_SYMBOL(snd_ctl_find_id);
 
 static int snd_ctl_card_info(struct snd_card *card, struct snd_ctl_file * ctl,
@@ -1413,11 +1411,11 @@ static long snd_ctl_ioctl(struct file *file, unsigned int cmd, unsigned long arg
 	case SNDRV_CTL_IOCTL_SUBSCRIBE_EVENTS:
 		return snd_ctl_subscribe_events(ctl, ip);
 	case SNDRV_CTL_IOCTL_TLV_READ:
-		return snd_ctl_tlv_ioctl(ctl, argp, SNDRV_CTL_TLV_OP_READ);
+		return snd_ctl_tlv_ioctl(ctl, argp, 0);
 	case SNDRV_CTL_IOCTL_TLV_WRITE:
-		return snd_ctl_tlv_ioctl(ctl, argp, SNDRV_CTL_TLV_OP_WRITE);
+		return snd_ctl_tlv_ioctl(ctl, argp, 1);
 	case SNDRV_CTL_IOCTL_TLV_COMMAND:
-		return snd_ctl_tlv_ioctl(ctl, argp, SNDRV_CTL_TLV_OP_CMD);
+		return snd_ctl_tlv_ioctl(ctl, argp, -1);
 	case SNDRV_CTL_IOCTL_POWER:
 		return -ENOPROTOOPT;
 	case SNDRV_CTL_IOCTL_POWER_STATE:
@@ -1436,7 +1434,7 @@ static long snd_ctl_ioctl(struct file *file, unsigned int cmd, unsigned long arg
 		}
 	}
 	up_read(&snd_ioctl_rwsem);
-	dev_dbg(card->dev, "unknown ioctl = 0x%x\n", cmd);
+	snd_printdd("unknown ioctl = 0x%x\n", cmd);
 	return -ENOTTY;
 }
 
@@ -1533,28 +1531,19 @@ static int _snd_ctl_register_ioctl(snd_kctl_ioctl_func_t fcn, struct list_head *
 	return 0;
 }
 
-/**
- * snd_ctl_register_ioctl - register the device-specific control-ioctls
- * @fcn: ioctl callback function
- *
- * called from each device manager like pcm.c, hwdep.c, etc.
- */
 int snd_ctl_register_ioctl(snd_kctl_ioctl_func_t fcn)
 {
 	return _snd_ctl_register_ioctl(fcn, &snd_control_ioctls);
 }
+
 EXPORT_SYMBOL(snd_ctl_register_ioctl);
 
 #ifdef CONFIG_COMPAT
-/**
- * snd_ctl_register_ioctl_compat - register the device-specific 32bit compat
- * control-ioctls
- * @fcn: ioctl callback function
- */
 int snd_ctl_register_ioctl_compat(snd_kctl_ioctl_func_t fcn)
 {
 	return _snd_ctl_register_ioctl(fcn, &snd_control_compat_ioctls);
 }
+
 EXPORT_SYMBOL(snd_ctl_register_ioctl_compat);
 #endif
 
@@ -1582,26 +1571,19 @@ static int _snd_ctl_unregister_ioctl(snd_kctl_ioctl_func_t fcn,
 	return -EINVAL;
 }
 
-/**
- * snd_ctl_unregister_ioctl - de-register the device-specific control-ioctls
- * @fcn: ioctl callback function to unregister
- */
 int snd_ctl_unregister_ioctl(snd_kctl_ioctl_func_t fcn)
 {
 	return _snd_ctl_unregister_ioctl(fcn, &snd_control_ioctls);
 }
+
 EXPORT_SYMBOL(snd_ctl_unregister_ioctl);
 
 #ifdef CONFIG_COMPAT
-/**
- * snd_ctl_unregister_ioctl - de-register the device-specific compat 32bit
- * control-ioctls
- * @fcn: ioctl callback function to unregister
- */
 int snd_ctl_unregister_ioctl_compat(snd_kctl_ioctl_func_t fcn)
 {
 	return _snd_ctl_unregister_ioctl(fcn, &snd_control_compat_ioctls);
 }
+
 EXPORT_SYMBOL(snd_ctl_unregister_ioctl_compat);
 #endif
 
@@ -1612,27 +1594,6 @@ static int snd_ctl_fasync(int fd, struct file * file, int on)
 	ctl = file->private_data;
 	return fasync_helper(fd, file, on, &ctl->fasync);
 }
-
-/* return the preferred subdevice number if already assigned;
- * otherwise return -1
- */
-int snd_ctl_get_preferred_subdevice(struct snd_card *card, int type)
-{
-	struct snd_ctl_file *kctl;
-	int subdevice = -1;
-
-	read_lock(&card->ctl_files_rwlock);
-	list_for_each_entry(kctl, &card->ctl_files, list) {
-		if (kctl->pid == task_pid(current)) {
-			subdevice = kctl->preferred_subdevice[type];
-			if (subdevice != -1)
-				break;
-		}
-	}
-	read_unlock(&card->ctl_files_rwlock);
-	return subdevice;
-}
-EXPORT_SYMBOL_GPL(snd_ctl_get_preferred_subdevice);
 
 /*
  * ioctl32 compat
@@ -1666,9 +1627,19 @@ static const struct file_operations snd_ctl_f_ops =
 static int snd_ctl_dev_register(struct snd_device *device)
 {
 	struct snd_card *card = device->device_data;
+	int err, cardnum;
+	char name[16];
 
-	return snd_register_device(SNDRV_DEVICE_TYPE_CONTROL, card, -1,
-				   &snd_ctl_f_ops, card, &card->ctl_dev);
+	if (snd_BUG_ON(!card))
+		return -ENXIO;
+	cardnum = card->number;
+	if (snd_BUG_ON(cardnum < 0 || cardnum >= SNDRV_CARDS))
+		return -ENXIO;
+	sprintf(name, "controlC%i", cardnum);
+	if ((err = snd_register_device(SNDRV_DEVICE_TYPE_CONTROL, card, -1,
+				       &snd_ctl_f_ops, card, name)) < 0)
+		return err;
+	return 0;
 }
 
 /*
@@ -1678,6 +1649,13 @@ static int snd_ctl_dev_disconnect(struct snd_device *device)
 {
 	struct snd_card *card = device->device_data;
 	struct snd_ctl_file *ctl;
+	int err, cardnum;
+
+	if (snd_BUG_ON(!card))
+		return -ENXIO;
+	cardnum = card->number;
+	if (snd_BUG_ON(cardnum < 0 || cardnum >= SNDRV_CARDS))
+		return -ENXIO;
 
 	read_lock(&card->ctl_files_rwlock);
 	list_for_each_entry(ctl, &card->ctl_files, list) {
@@ -1686,7 +1664,10 @@ static int snd_ctl_dev_disconnect(struct snd_device *device)
 	}
 	read_unlock(&card->ctl_files_rwlock);
 
-	return snd_unregister_device(&card->ctl_dev);
+	if ((err = snd_unregister_device(SNDRV_DEVICE_TYPE_CONTROL,
+					 card, -1)) < 0)
+		return err;
+	return 0;
 }
 
 /*
@@ -1703,7 +1684,6 @@ static int snd_ctl_dev_free(struct snd_device *device)
 		snd_ctl_remove(card, control);
 	}
 	up_write(&card->controls_rwsem);
-	put_device(&card->ctl_dev);
 	return 0;
 }
 
@@ -1718,34 +1698,14 @@ int snd_ctl_create(struct snd_card *card)
 		.dev_register =	snd_ctl_dev_register,
 		.dev_disconnect = snd_ctl_dev_disconnect,
 	};
-	int err;
 
 	if (snd_BUG_ON(!card))
 		return -ENXIO;
-	if (snd_BUG_ON(card->number < 0 || card->number >= SNDRV_CARDS))
-		return -ENXIO;
-
-	snd_device_initialize(&card->ctl_dev, card);
-	dev_set_name(&card->ctl_dev, "controlC%d", card->number);
-
-	err = snd_device_new(card, SNDRV_DEV_CONTROL, card, &ops);
-	if (err < 0)
-		put_device(&card->ctl_dev);
-	return err;
+	return snd_device_new(card, SNDRV_DEV_CONTROL, card, &ops);
 }
 
 /*
  * Frequently used control callbacks/helpers
- */
-
-/**
- * snd_ctl_boolean_mono_info - Helper function for a standard boolean info
- * callback with a mono channel
- * @kcontrol: the kcontrol instance
- * @uinfo: info to store
- *
- * This is a function that can be used as info callback for a standard
- * boolean control with a single mono channel.
  */
 int snd_ctl_boolean_mono_info(struct snd_kcontrol *kcontrol,
 			      struct snd_ctl_elem_info *uinfo)
@@ -1756,17 +1716,9 @@ int snd_ctl_boolean_mono_info(struct snd_kcontrol *kcontrol,
 	uinfo->value.integer.max = 1;
 	return 0;
 }
+
 EXPORT_SYMBOL(snd_ctl_boolean_mono_info);
 
-/**
- * snd_ctl_boolean_stereo_info - Helper function for a standard boolean info
- * callback with stereo two channels
- * @kcontrol: the kcontrol instance
- * @uinfo: info to store
- *
- * This is a function that can be used as info callback for a standard
- * boolean control with stereo two channels.
- */
 int snd_ctl_boolean_stereo_info(struct snd_kcontrol *kcontrol,
 				struct snd_ctl_elem_info *uinfo)
 {
@@ -1776,6 +1728,7 @@ int snd_ctl_boolean_stereo_info(struct snd_kcontrol *kcontrol,
 	uinfo->value.integer.max = 1;
 	return 0;
 }
+
 EXPORT_SYMBOL(snd_ctl_boolean_stereo_info);
 
 /**
@@ -1797,13 +1750,8 @@ int snd_ctl_enum_info(struct snd_ctl_elem_info *info, unsigned int channels,
 	info->type = SNDRV_CTL_ELEM_TYPE_ENUMERATED;
 	info->count = channels;
 	info->value.enumerated.items = items;
-	if (!items)
-		return 0;
 	if (info->value.enumerated.item >= items)
 		info->value.enumerated.item = items - 1;
-	WARN(strlen(names[info->value.enumerated.item]) >= sizeof(info->value.enumerated.name),
-	     "ALSA: too long item name '%s'\n",
-	     names[info->value.enumerated.item]);
 	strlcpy(info->value.enumerated.name,
 		names[info->value.enumerated.item],
 		sizeof(info->value.enumerated.name));
