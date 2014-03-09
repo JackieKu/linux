@@ -418,9 +418,8 @@ static int create_card(struct usb_device *usb_dev,
 	if (devnum >= SNDRV_CARDS)
 		return -ENODEV;
 
-	err = snd_card_new(&intf->dev,
-			   index[devnum], id[devnum], THIS_MODULE,
-			   sizeof(struct snd_usb_caiaqdev), &card);
+	err = snd_card_create(index[devnum], id[devnum], THIS_MODULE,
+			      sizeof(struct snd_usb_caiaqdev), &card);
 	if (err < 0)
 		return err;
 
@@ -430,6 +429,7 @@ static int create_card(struct usb_device *usb_dev,
 	cdev->chip.usb_id = USB_ID(le16_to_cpu(usb_dev->descriptor.idVendor),
 				  le16_to_cpu(usb_dev->descriptor.idProduct));
 	spin_lock_init(&cdev->spinlock);
+	snd_card_set_dev(card, &intf->dev);
 
 	*cardp = card;
 	return 0;
@@ -469,12 +469,10 @@ static int init_card(struct snd_usb_caiaqdev *cdev)
 
 	err = snd_usb_caiaq_send_command(cdev, EP1_CMD_GET_DEVICE_INFO, NULL, 0);
 	if (err)
-		goto err_kill_urb;
+		return err;
 
-	if (!wait_event_timeout(cdev->ep1_wait_queue, cdev->spec_received, HZ)) {
-		err = -ENODEV;
-		goto err_kill_urb;
-	}
+	if (!wait_event_timeout(cdev->ep1_wait_queue, cdev->spec_received, HZ))
+		return -ENODEV;
 
 	usb_string(usb_dev, usb_dev->descriptor.iManufacturer,
 		   cdev->vendor_name, CAIAQ_USB_STR_LEN);
@@ -509,10 +507,6 @@ static int init_card(struct snd_usb_caiaqdev *cdev)
 
 	setup_card(cdev);
 	return 0;
-
- err_kill_urb:
-	usb_kill_urb(&cdev->ep1_in_urb);
-	return err;
 }
 
 static int snd_probe(struct usb_interface *intf,
