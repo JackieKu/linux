@@ -1,7 +1,7 @@
 VERSION = 3
 PATCHLEVEL = 16
 SUBLEVEL = 5
-EXTRAVERSION =
+EXTRAVERSION = -gentoo
 NAME = Museum of Fishiegoodies
 
 # *DOCUMENTATION*
