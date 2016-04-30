@@ -2803,7 +2803,7 @@ static void intel8x0_measure_ac97_clock(struct intel8x0 *chip)
 		iputbyte(chip, port + ICH_REG_OFF_CR, ICH_IOCE);
 		iputdword(chip, ICHREG(ALI_DMACR), 1 << ichdev->ali_slot);
 	}
-	do_posix_clock_monotonic_gettime(&start_time);
+	ktime_get_ts(&start_time);
 	spin_unlock_irq(&chip->reg_lock);
 	msleep(50);
 	spin_lock_irq(&chip->reg_lock);
@@ -2827,7 +2827,7 @@ static void intel8x0_measure_ac97_clock(struct intel8x0 *chip)
 		pos += ichdev->position;
 	}
 	chip->in_measurement = 0;
-	do_posix_clock_monotonic_gettime(&stop_time);
+	ktime_get_ts(&stop_time);
 	/* stop */
 	if (chip->device_type == DEVICE_ALI) {
 		iputdword(chip, ICHREG(ALI_DMACR), 1 << (ichdev->ali_slot + 16));
