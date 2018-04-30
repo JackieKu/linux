@@ -19,6 +19,23 @@
 
 #include "nf_internals.h"
 
+#if defined(CONFIG_IMQ) || defined(CONFIG_IMQ_MODULE)
+static const struct nf_queue_handler __rcu *queue_imq_handler __read_mostly;
+
+void nf_register_queue_imq_handler(const struct nf_queue_handler *qh)
+{
+	rcu_assign_pointer(queue_imq_handler, qh);
+}
+EXPORT_SYMBOL_GPL(nf_register_queue_imq_handler);
+
+void nf_unregister_queue_imq_handler(void)
+{
+	RCU_INIT_POINTER(queue_imq_handler, NULL);
+	synchronize_rcu();
+}
+EXPORT_SYMBOL_GPL(nf_unregister_queue_imq_handler);
+#endif
+
 /*
  * Hook for nfnetlink_queue to register its queue handler.
  * We do this so that most of the NFQUEUE code can be modular.
@@ -114,7 +131,8 @@ void nf_queue_nf_hook_drop(struct net *net, struct nf_hook_ops *ops)
 int nf_queue(struct sk_buff *skb,
 	     struct nf_hook_ops *elem,
 	     struct nf_hook_state *state,
-	     unsigned int queuenum)
+	     unsigned int queuenum,
+		 unsigned int queuetype)
 {
 	int status = -ENOENT;
 	struct nf_queue_entry *entry = NULL;
@@ -123,7 +141,17 @@ int nf_queue(struct sk_buff *skb,
 	struct net *net = state->net;
 
 	/* QUEUE == DROP if no one is waiting, to be safe. */
-	qh = rcu_dereference(net->nf.queue_handler);
+	if (queuetype == NF_IMQ_QUEUE) {
+#if defined(CONFIG_IMQ) || defined(CONFIG_IMQ_MODULE)
+		qh = rcu_dereference(queue_imq_handler);
+#else
+		BUG();
+		goto err_unlock;
+#endif
+	} else {
+		qh = rcu_dereference(net->nf.queue_handler);
+	}
+
 	if (!qh) {
 		status = -ESRCH;
 		goto err;
@@ -198,8 +226,10 @@ void nf_reinject(struct nf_queue_entry *entry, unsigned int verdict)
 		local_bh_enable();
 		break;
 	case NF_QUEUE:
+	case NF_IMQ_QUEUE:
 		err = nf_queue(skb, elem, &entry->state,
-			       verdict >> NF_VERDICT_QBITS);
+			       verdict >> NF_VERDICT_QBITS,
+				   verdict & NF_VERDICT_MASK);
 		if (err < 0) {
 			if (err == -ESRCH &&
 			   (verdict & NF_VERDICT_FLAG_QUEUE_BYPASS))
