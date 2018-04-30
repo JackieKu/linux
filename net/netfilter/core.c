@@ -311,9 +311,11 @@ next_hook:
 		ret = NF_DROP_GETERR(verdict);
 		if (ret == 0)
 			ret = -EPERM;
-	} else if ((verdict & NF_VERDICT_MASK) == NF_QUEUE) {
+	} else if ((verdict & NF_VERDICT_MASK) == NF_QUEUE ||
+		(verdict & NF_VERDICT_MASK) == NF_IMQ_QUEUE) {
 		int err = nf_queue(skb, elem, state,
-				   verdict >> NF_VERDICT_QBITS);
+				   verdict >> NF_VERDICT_QBITS,
+				  verdict & NF_VERDICT_MASK);
 		if (err < 0) {
 			if (err == -ESRCH &&
 			   (verdict & NF_VERDICT_FLAG_QUEUE_BYPASS))
